@@ -5,7 +5,11 @@
 
 #include "tlg_copy.h"
 
+#include <array>
+#include <chrono>
+#include <cstdlib>
 #include <deque>
+#include <memory>
 #include <boost/container/small_vector.hpp>
 
 #include "common/interval_set.h"
@@ -120,6 +124,10 @@ public:
     /// Commits pending sparse buffer memory binds. Must be called before every scheduler submit.
     void SubmitPendingArenaBinds(Vulkan::SubmitInfo& info);
 
+    /// tlg: records copies of the GPU-written data in the windows the CPU read back before, at
+    /// the end of the command buffer about to be submitted with `tick` (Rasterizer::Flush).
+    void SnapshotReadbacks(u64 tick);
+
 private:
     struct ArenaBinds {
         const Buffer* arena;
@@ -139,6 +147,40 @@ private:
     void EnsureResident(const Buffer* arena, u64 first_block, u64 last_block);
 
     void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size);
+
+    /// tlg: eager readbacks (TLG_EAGER_READBACK, on by default). A CPU read of GPU-written
+    /// data waited for the whole GPU queue (Finish), dozens of times per frame on slow GPUs.
+    /// The windows the CPU read before are copied to host memory at every Rasterizer::Flush;
+    /// a later read whose window the GPU has not written since waits only for that submission.
+    static constexpr u64 EAGER_WINDOW_SIZE = 256_KB;
+    static constexpr size_t EAGER_WINDOWS = 32;
+    struct EagerSlot {
+        std::unique_ptr<Buffer> buffer;
+        u64 tick{};
+        u64 seq{};
+        bool valid{};
+    };
+    struct EagerWindow {
+        VAddr base{}; ///< 0: unused
+        u64 write_seq{1};
+        u64 last_use{};
+        std::array<EagerSlot, 2> slots{};
+        u32 newest{};
+    };
+    bool DownloadFromSnapshots(VAddr device_addr, u64 size);
+    EagerWindow* FindEagerWindow(VAddr base);
+    void NoteEagerMiss(VAddr address, u64 size);
+    void NoteEagerWrite(VAddr address, u64 size);
+    void ReportEagerReadbacks();
+    const bool eager_readbacks = [] {
+        const char* value = std::getenv("TLG_EAGER_READBACK");
+        return !(value && value[0] == '0');
+    }();
+    std::array<EagerWindow, EAGER_WINDOWS> eager_windows{};
+    u32 eager_count{};
+    u64 eager_clock{};
+    u64 eager_served{}, eager_waited{}, eager_missed{}, eager_snapshots{}, eager_wait_ns{};
+    std::chrono::steady_clock::time_point eager_report{};
 
     bool SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size, bool is_written,
                            bool is_texel_buffer);

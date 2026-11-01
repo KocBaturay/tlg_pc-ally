@@ -190,6 +190,9 @@ void BufferCache::ReleaseReadProtection(VAddr device_addr, u64 size) {
 }
 
 void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size) {
+    if (eager_readbacks && DownloadFromSnapshots(device_addr, size)) {
+        return;
+    }
     boost::container::small_vector<vk::BufferCopy, 1> copies;
     u64 total_size_bytes = 0;
     const VAddr arena_base = arena->cpu_addr;
@@ -213,6 +216,12 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     if (total_size_bytes == 0) {
         return;
     }
+    if (eager_readbacks) {
+        ++eager_missed;
+        for (const auto& copy : copies) {
+            NoteEagerMiss(arena_base + copy.srcOffset, copy.size);
+        }
+    }
     const auto download = staging_pool.Request(total_size_bytes, VideoCore::MemoryType::HostCached);
     for (auto& copy : copies) {
         copy.dstOffset += download.offset;
@@ -227,6 +236,183 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
                                 copy.size);
     }
     memory_tracker->UnmarkRegionAsGpuModified(device_addr, size);
+}
+
+BufferCache::EagerWindow* BufferCache::FindEagerWindow(VAddr base) {
+    for (auto& window : eager_windows) {
+        if (window.base == base) {
+            return &window;
+        }
+    }
+    return nullptr;
+}
+
+void BufferCache::NoteEagerMiss(VAddr address, u64 size) {
+    const VAddr end = address + size;
+    for (VAddr base = Common::AlignDown(address, EAGER_WINDOW_SIZE); base < end;
+         base += EAGER_WINDOW_SIZE) {
+        if (EagerWindow* window = FindEagerWindow(base)) {
+            window->last_use = ++eager_clock;
+            continue;
+        }
+        // A new hot window takes a free entry, else the least recently read one.
+        EagerWindow* victim = &eager_windows[0];
+        for (auto& window : eager_windows) {
+            if (!window.base) {
+                victim = &window;
+                break;
+            }
+            if (window.last_use < victim->last_use) {
+                victim = &window;
+            }
+        }
+        // A buffer a pending snapshot copies into is not reused before the GPU is past it.
+        bool busy = false;
+        for (const auto& slot : victim->slots) {
+            busy |= slot.buffer && !scheduler.IsFree(slot.tick);
+        }
+        if (busy) {
+            continue;
+        }
+        eager_count += !victim->base;
+        victim->base = base;
+        victim->write_seq = 1;
+        victim->last_use = ++eager_clock;
+        for (auto& slot : victim->slots) {
+            slot.valid = false;
+        }
+    }
+}
+
+void BufferCache::NoteEagerWrite(VAddr address, u64 size) {
+    const VAddr end = address + size;
+    for (auto& window : eager_windows) {
+        if (window.base && window.base < end && address < window.base + EAGER_WINDOW_SIZE) {
+            ++window.write_seq;
+        }
+    }
+}
+
+void BufferCache::SnapshotReadbacks(u64 tick) {
+    if (!eager_readbacks || !eager_count) {
+        return;
+    }
+    for (auto& window : eager_windows) {
+        if (!window.base) {
+            continue;
+        }
+        const auto& current = window.slots[window.newest];
+        if (current.valid && current.seq == window.write_seq) {
+            continue; // the GPU has not written the window since the last snapshot
+        }
+        boost::container::small_vector<vk::BufferCopy, 8> copies;
+        const Buffer* arena = nullptr;
+        bool one_arena = true;
+        gpu_modified_ranges.ForEachInRange(window.base, EAGER_WINDOW_SIZE,
+                                           [&](VAddr start, VAddr end) {
+            const Buffer* range_arena = GetArena(start >> block_shift, (end - 1) >> block_shift);
+            one_arena &= !arena || range_arena == arena;
+            arena = range_arena;
+            copies.push_back(vk::BufferCopy{
+                .srcOffset = start - range_arena->cpu_addr,
+                .dstOffset = start - window.base,
+                .size = end - start,
+            });
+        });
+        if (!one_arena || copies.empty()) {
+            continue;
+        }
+        // The other slot: the newest snapshot stays readable until this one is.
+        const u32 index = window.newest ^ 1;
+        auto& slot = window.slots[index];
+        if (slot.buffer && !scheduler.IsFree(slot.tick)) {
+            continue;
+        }
+        if (!slot.buffer) {
+            slot.buffer = std::make_unique<Buffer>(instance, 0, EAGER_WINDOW_SIZE,
+                                                   MemoryType::HostCached, "Eager readback");
+            if (slot.buffer->mapped_data.empty()) {
+                slot.buffer.reset();
+                continue;
+            }
+        }
+        runtime.CopyBuffer(arena, slot.buffer.get(), copies);
+        slot.tick = tick;
+        slot.seq = window.write_seq;
+        slot.valid = true;
+        window.newest = index;
+        ++eager_snapshots;
+    }
+}
+
+bool BufferCache::DownloadFromSnapshots(VAddr device_addr, u64 size) {
+    ReportEagerReadbacks();
+    if (!eager_count) {
+        return false;
+    }
+    // Every GPU-written byte of the request must be in a snapshot taken after the GPU's last
+    // write to its window; else the whole request takes the normal path.
+    boost::container::small_vector<std::pair<VAddr, VAddr>, 8> ranges;
+    bool covered = true;
+    memory_tracker->ForEachDownloadRange<false>(device_addr, size, [&](u64 address, u64 length) {
+        gpu_modified_ranges.ForEachInRange(address, length, [&](VAddr start, VAddr end) {
+            ranges.emplace_back(start, end);
+            for (VAddr base = Common::AlignDown(start, EAGER_WINDOW_SIZE); base < end;
+                 base += EAGER_WINDOW_SIZE) {
+                const EagerWindow* window = FindEagerWindow(base);
+                const EagerSlot* slot = window ? &window->slots[window->newest] : nullptr;
+                covered &= slot && slot->valid && slot->seq == window->write_seq;
+            }
+        });
+    });
+    if (!covered || ranges.empty()) {
+        return false;
+    }
+    for (const auto& [start, end] : ranges) {
+        for (VAddr base = Common::AlignDown(start, EAGER_WINDOW_SIZE); base < end;
+             base += EAGER_WINDOW_SIZE) {
+            EagerWindow* window = FindEagerWindow(base);
+            EagerSlot& slot = window->slots[window->newest];
+            if (!scheduler.IsFree(slot.tick)) {
+                const auto wait_start = std::chrono::steady_clock::now();
+                scheduler.Wait(slot.tick);
+                eager_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now() - wait_start).count();
+                ++eager_waited;
+            }
+            window->last_use = ++eager_clock;
+            const VAddr copy_start = std::max(start, base);
+            const VAddr copy_end = std::min(end, base + EAGER_WINDOW_SIZE);
+            const u64 offset = copy_start - base;
+            slot.buffer->Invalidate(offset, copy_end - copy_start);
+            memory->TryWriteBacking(std::bit_cast<u8*>(copy_start),
+                                    slot.buffer->mapped_data.data() + offset,
+                                    copy_end - copy_start);
+        }
+    }
+    memory_tracker->ForEachDownloadRange<false>(device_addr, size, [&](u64 address, u64 length) {
+        gpu_modified_ranges.Subtract(address, length);
+    });
+    memory_tracker->UnmarkRegionAsGpuModified(device_addr, size);
+    ++eager_served;
+    return true;
+}
+
+void BufferCache::ReportEagerReadbacks() {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - eager_report < std::chrono::seconds(5)) {
+        return;
+    }
+    if (eager_served || eager_missed) {
+        std::printf("Eager readback: %llu reads from snapshots (%llu waited, %.1f ms), %llu full "
+                    "GPU waits, %llu snapshots, %u windows\n",
+                    static_cast<unsigned long long>(eager_served),
+                    static_cast<unsigned long long>(eager_waited), eager_wait_ns / 1e6,
+                    static_cast<unsigned long long>(eager_missed),
+                    static_cast<unsigned long long>(eager_snapshots), eager_count);
+    }
+    eager_served = eager_waited = eager_missed = eager_snapshots = eager_wait_ns = 0;
+    eager_report = now;
 }
 
 namespace {
@@ -362,6 +548,9 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     }
     if (is_written) {
         gpu_modified_ranges.Add(device_addr, size);
+        if (eager_count) {
+            NoteEagerWrite(device_addr, size);
+        }
     }
     return {arena, arena->Offset(device_addr)};
 }

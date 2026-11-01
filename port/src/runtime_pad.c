@@ -162,8 +162,11 @@ static SDL_Gamepad *current_gamepad(void) {
         }
         SDL_free(ids);
     }
+    /* Only while the current pad is idle: a virtual pad mirroring a real one (Steam Input,
+     * DS4Windows, the ROG Ally's built-in pad) would otherwise take over on every frame. */
+    const int current_idle=!gamepad || !gamepad_active(gamepad);
     for (int i=0;i<MAX_GAMEPADS;++i)
-        if (gamepads[i] && gamepads[i]!=gamepad && (!gamepad || gamepad_active(gamepads[i]))) {
+        if (gamepads[i] && gamepads[i]!=gamepad && (!gamepad || (current_idle && gamepad_active(gamepads[i])))) {
             if (gamepad) printf("Runtime: gamepad in use: %s\n",SDL_GetGamepadName(gamepads[i]));
             gamepad=gamepads[i];
             break;
