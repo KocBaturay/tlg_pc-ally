@@ -152,8 +152,9 @@ private:
     /// data waited for the whole GPU queue (Finish), dozens of times per frame on slow GPUs.
     /// The windows the CPU read before are copied to host memory at every Rasterizer::Flush;
     /// a later read whose window the GPU has not written since waits only for that submission.
-    static constexpr u64 EAGER_WINDOW_SIZE = 256_KB;
-    static constexpr size_t EAGER_WINDOWS = 32;
+    /// The download window of ReadMemory, so one request is one snapshot window.
+    static constexpr u64 EAGER_WINDOW_SIZE = 512_KB;
+    static constexpr size_t EAGER_WINDOWS = 64;
     struct EagerSlot {
         std::unique_ptr<Buffer> buffer;
         u64 tick{};
@@ -180,6 +181,10 @@ private:
     u32 eager_count{};
     u64 eager_clock{};
     u64 eager_served{}, eager_waited{}, eager_missed{}, eager_snapshots{}, eager_wait_ns{};
+    /// Why requests missed: window not tracked, or written by the GPU after its snapshot; and
+    /// how many of the misses were CPU writes (InvalidateMemory) rather than reads.
+    u64 eager_miss_cold{}, eager_miss_stale{}, eager_miss_writes{};
+    bool eager_request_is_write{};
     std::chrono::steady_clock::time_point eager_report{};
 
     bool SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size, bool is_written,

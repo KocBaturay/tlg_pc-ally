@@ -173,7 +173,9 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
             std::max<VAddr>(Common::AlignDown(device_addr, WindowSize), arena->cpu_addr);
         const VAddr window_end = std::min<VAddr>(
             std::max<VAddr>(window_start + WindowSize, device_addr + size), arena_end);
+        eager_request_is_write = is_write;
         DownloadMemory(arena, window_start, window_end - window_start);
+        eager_request_is_write = false;
         if (is_write) {
             memory_tracker->MarkRegionAsCpuModified(device_addr, size);
         }
@@ -218,6 +220,7 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     }
     if (eager_readbacks) {
         ++eager_missed;
+        eager_miss_writes += eager_request_is_write;
         for (const auto& copy : copies) {
             NoteEagerMiss(arena_base + copy.srcOffset, copy.size);
         }
@@ -353,7 +356,7 @@ bool BufferCache::DownloadFromSnapshots(VAddr device_addr, u64 size) {
     // Every GPU-written byte of the request must be in a snapshot taken after the GPU's last
     // write to its window; else the whole request takes the normal path.
     boost::container::small_vector<std::pair<VAddr, VAddr>, 8> ranges;
-    bool covered = true;
+    bool covered = true, cold = false;
     memory_tracker->ForEachDownloadRange<false>(device_addr, size, [&](u64 address, u64 length) {
         gpu_modified_ranges.ForEachInRange(address, length, [&](VAddr start, VAddr end) {
             ranges.emplace_back(start, end);
@@ -361,10 +364,15 @@ bool BufferCache::DownloadFromSnapshots(VAddr device_addr, u64 size) {
                  base += EAGER_WINDOW_SIZE) {
                 const EagerWindow* window = FindEagerWindow(base);
                 const EagerSlot* slot = window ? &window->slots[window->newest] : nullptr;
+                cold |= !window;
                 covered &= slot && slot->valid && slot->seq == window->write_seq;
             }
         });
     });
+    if (!covered && !ranges.empty()) {
+        eager_miss_cold += cold;
+        eager_miss_stale += !cold;
+    }
     if (!covered || ranges.empty()) {
         return false;
     }
@@ -405,13 +413,18 @@ void BufferCache::ReportEagerReadbacks() {
     }
     if (eager_served || eager_missed) {
         std::printf("Eager readback: %llu reads from snapshots (%llu waited, %.1f ms), %llu full "
-                    "GPU waits, %llu snapshots, %u windows\n",
+                    "GPU waits (%llu CPU writes; %llu untracked, %llu written since snapshot), "
+                    "%llu snapshots, %u windows\n",
                     static_cast<unsigned long long>(eager_served),
                     static_cast<unsigned long long>(eager_waited), eager_wait_ns / 1e6,
                     static_cast<unsigned long long>(eager_missed),
+                    static_cast<unsigned long long>(eager_miss_writes),
+                    static_cast<unsigned long long>(eager_miss_cold),
+                    static_cast<unsigned long long>(eager_miss_stale),
                     static_cast<unsigned long long>(eager_snapshots), eager_count);
     }
     eager_served = eager_waited = eager_missed = eager_snapshots = eager_wait_ns = 0;
+    eager_miss_cold = eager_miss_stale = eager_miss_writes = 0;
     eager_report = now;
 }
 
