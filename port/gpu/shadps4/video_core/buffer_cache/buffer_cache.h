@@ -6,10 +6,14 @@
 #include "tlg_copy.h"
 
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <mutex>
 #include <cstdlib>
 #include <deque>
 #include <memory>
+#include <unordered_set>
+#include <vector>
 #include <boost/container/small_vector.hpp>
 
 #include "common/interval_set.h"
@@ -112,7 +116,7 @@ public:
 
     /// True when GPU writes to these exact bytes have not been downloaded yet.
     [[nodiscard]] bool HasPendingGpuWrite(VAddr addr, size_t size) const {
-        return gpu_modified_ranges.Intersects(addr, size);
+        return gpu_modified_ranges.Intersects(addr, size) || MergePending(addr, size);
     }
 
     /// Processes the fault buffer.
@@ -194,6 +198,48 @@ private:
     bool eager_request_is_write{};
     VAddr eager_request_addr{};
     std::chrono::steady_clock::time_point eager_report{};
+
+    /// tlg: deferred write merges (TLG_WRITE_MERGE, on by default). A CPU write fault on a page
+    /// where a shader wrote a few bytes in the current frame waited for the whole GPU queue,
+    /// ~15 times per frame in the per-frame heap. Instead the GPU's bytes are copied to host
+    /// memory by the GPU (no wait), the stale CPU values kept as a pre-image, and the CPU
+    /// writes at once. Bytes the CPU has not changed (equal to the pre-image) are left out of
+    /// uploads, so the GPU keeps its values, and get the GPU's values in guest memory once the
+    /// copy is done (at a Flush). Only in windows the CPU never read GPU data from: a CPU read
+    /// of those bytes before the merge would see the old values.
+    struct MergeRange {
+        VAddr start, end;
+        u64 offset; ///< into pre / gpu
+    };
+    struct WriteMerge {
+        u64 tick{};
+        u32 flushes{};
+        std::unique_ptr<Buffer> gpu;
+        std::vector<u8> pre;
+        boost::container::small_vector<MergeRange, 8> ranges;
+    };
+    static constexpr u64 MERGE_MAX_BYTES = 64_KB;
+    static constexpr size_t MERGE_MAX_PENDING = 128;
+    bool DeferWriteFault(VAddr device_addr, u64 size);
+    [[nodiscard]] bool MergePending(VAddr addr, u64 size) const;
+    /// Bytes in [addr, addr+size) the GPU owns through a pending merge (not changed by the CPU).
+    template <typename Func>
+    void ForEachMergeOwned(VAddr addr, u64 size, Func&& func);
+    void DropMergeRanges(VAddr addr, u64 size);
+    void ResolveMerges(bool force);
+    const bool write_merge = [] {
+        const char* value = std::getenv("TLG_WRITE_MERGE");
+        return !(value && value[0] == '0');
+    }();
+    /// Guards `merges` and its bounds: the draw pipeline's first stage asks MergePending while
+    /// the recording stage binds buffers.
+    mutable std::mutex merge_mutex;
+    std::atomic<u32> merge_count{};
+    std::deque<WriteMerge> merges;
+    std::vector<std::unique_ptr<Buffer>> merge_buffers;
+    VAddr merge_lo{~0ULL}, merge_hi{};
+    std::unordered_set<VAddr> read_windows; ///< EAGER_WINDOW_SIZE bases the CPU read GPU data in
+    u64 merges_deferred{}, merges_resolved{}, merges_waited{}, merge_bytes_kept{};
 
     bool SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size, bool is_written,
                            bool is_texel_buffer);

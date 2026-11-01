@@ -193,7 +193,13 @@ void BufferCache::ReleaseReadProtection(VAddr device_addr, u64 size) {
 }
 
 void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size) {
+    if (!eager_request_is_write) {
+        read_windows.insert(Common::AlignDown(device_addr, EAGER_WINDOW_SIZE));
+    }
     if (eager_readbacks && DownloadFromSnapshots(device_addr, size)) {
+        return;
+    }
+    if (write_merge && eager_request_is_write && DeferWriteFault(device_addr, size)) {
         return;
     }
     boost::container::small_vector<vk::BufferCopy, 1> copies;
@@ -240,6 +246,203 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
                                 copy.size);
     }
     memory_tracker->UnmarkRegionAsGpuModified(device_addr, size);
+}
+
+bool BufferCache::DeferWriteFault(VAddr device_addr, u64 size) {
+    if (read_windows.contains(Common::AlignDown(device_addr, EAGER_WINDOW_SIZE)) ||
+        merges.size() >= MERGE_MAX_PENDING) {
+        return false;
+    }
+    boost::container::small_vector<std::pair<VAddr, VAddr>, 8> ranges;
+    u64 total = 0;
+    memory_tracker->ForEachDownloadRange<false>(device_addr, size, [&](u64 address, u64 length) {
+        gpu_modified_ranges.ForEachInRange(address, length, [&](VAddr start, VAddr end) {
+            ranges.emplace_back(start, end);
+            total += end - start;
+        });
+    });
+    if (ranges.empty() || total > MERGE_MAX_BYTES) {
+        return false;
+    }
+    const Buffer* arena =
+        GetArena(ranges[0].first >> block_shift, (ranges[0].second - 1) >> block_shift);
+    for (const auto& [start, end] : ranges) {
+        // A merge never stacks on another: the pre-image would not be the CPU's last values.
+        if (!arena->IsInBounds(start, end - start) || MergePending(start, end - start)) {
+            return false;
+        }
+    }
+    WriteMerge merge;
+    if (!merge_buffers.empty()) {
+        merge.gpu = std::move(merge_buffers.back());
+        merge_buffers.pop_back();
+    } else {
+        merge.gpu = std::make_unique<Buffer>(instance, 0, MERGE_MAX_BYTES, MemoryType::HostCached,
+                                             "Write merge");
+        if (merge.gpu->mapped_data.empty()) {
+            return false;
+        }
+    }
+    merge.tick = scheduler.CurrentTick();
+    merge.pre.resize(total);
+    boost::container::small_vector<vk::BufferCopy, 8> copies;
+    u64 offset = 0;
+    for (const auto& [start, end] : ranges) {
+        merge.ranges.push_back({start, end, offset});
+        copies.push_back(vk::BufferCopy{
+            .srcOffset = start - arena->cpu_addr,
+            .dstOffset = offset,
+            .size = end - start,
+        });
+        memory->CopySparseMemory(start, merge.pre.data() + offset, end - start);
+        offset += end - start;
+    }
+    runtime.CopyBuffer(arena, merge.gpu.get(), copies);
+    {
+        // Published before the pages lose their GPU marks, so no reader sees neither.
+        std::scoped_lock lock{merge_mutex};
+        merge_lo = std::min(merge_lo, ranges.front().first);
+        merge_hi = std::max(merge_hi, ranges.back().second);
+        merges.push_back(std::move(merge));
+        merge_count.store(u32(merges.size()), std::memory_order_release);
+    }
+    // The CPU may now write: the GPU's bytes are owned by the merge, not pending downloads.
+    memory_tracker->ForEachDownloadRange<false>(device_addr, size, [&](u64 address, u64 length) {
+        gpu_modified_ranges.Subtract(address, length);
+    });
+    memory_tracker->UnmarkRegionAsGpuModified(device_addr, size);
+    ++merges_deferred;
+    return true;
+}
+
+bool BufferCache::MergePending(VAddr addr, u64 size) const {
+    if (merge_count.load(std::memory_order_acquire) == 0) {
+        return false;
+    }
+    std::scoped_lock lock{merge_mutex};
+    if (merges.empty() || addr >= merge_hi || addr + size <= merge_lo) {
+        return false;
+    }
+    for (const auto& merge : merges) {
+        for (const auto& range : merge.ranges) {
+            if (range.start < addr + size && addr < range.end) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+template <typename Func>
+void BufferCache::ForEachMergeOwned(VAddr addr, u64 size, Func&& func) {
+    std::scoped_lock lock{merge_mutex};
+    std::vector<u8> current;
+    for (const auto& merge : merges) {
+        for (const auto& range : merge.ranges) {
+            const VAddr start = std::max(range.start, addr);
+            const VAddr end = std::min(range.end, addr + size);
+            if (start >= end) {
+                continue;
+            }
+            current.resize(end - start);
+            memory->CopySparseMemory(start, current.data(), end - start);
+            const u8* pre = merge.pre.data() + range.offset + (start - range.start);
+            // Runs of bytes the CPU has not changed since the fault.
+            for (u64 i = 0; i < end - start;) {
+                if (current[i] != pre[i]) {
+                    ++i;
+                    continue;
+                }
+                u64 j = i;
+                while (j < end - start && current[j] == pre[j]) {
+                    ++j;
+                }
+                func(merge, range, start + i, start + j);
+                i = j;
+            }
+        }
+    }
+}
+
+void BufferCache::DropMergeRanges(VAddr addr, u64 size) {
+    if (!MergePending(addr, size)) {
+        return;
+    }
+    std::scoped_lock lock{merge_mutex};
+    const VAddr end = addr + size;
+    for (auto& merge : merges) {
+        boost::container::small_vector<MergeRange, 8> kept;
+        for (const auto& range : merge.ranges) {
+            if (range.end <= addr || end <= range.start) {
+                kept.push_back(range);
+                continue;
+            }
+            // The GPU writes these bytes again: they are tracked as GPU-modified from now on.
+            if (range.start < addr) {
+                kept.push_back({range.start, addr, range.offset});
+            }
+            if (end < range.end) {
+                kept.push_back({end, range.end, range.offset + (end - range.start)});
+            }
+        }
+        merge.ranges = std::move(kept);
+    }
+}
+
+void BufferCache::ResolveMerges(bool force) {
+    if (merge_count.load(std::memory_order_acquire) == 0) {
+        return;
+    }
+    std::scoped_lock lock{merge_mutex};
+    std::vector<u8> current;
+    for (auto it = merges.begin(); it != merges.end();) {
+        auto& merge = *it;
+        if (!merge.ranges.empty() && !scheduler.IsFree(merge.tick)) {
+            // Not before the GPU copy is done; after 3 Flushes (or when forced) wait for it.
+            // The tick of the command buffer being submitted cannot be waited for here.
+            if ((!force && ++merge.flushes < 3) || merge.tick >= scheduler.CurrentTick()) {
+                ++it;
+                continue;
+            }
+            scheduler.Wait(merge.tick);
+            ++merges_waited;
+        }
+        if (!merge.ranges.empty()) {
+            merge.gpu->Invalidate(0, MERGE_MAX_BYTES);
+        }
+        for (const auto& range : merge.ranges) {
+            const u64 length = range.end - range.start;
+            current.resize(length);
+            memory->CopySparseMemory(range.start, current.data(), length);
+            const u8* pre = merge.pre.data() + range.offset;
+            const u8* gpu = merge.gpu->mapped_data.data() + range.offset;
+            for (u64 i = 0; i < length;) {
+                if (current[i] != pre[i]) {
+                    ++i; // the CPU wrote this byte after the fault: its value wins
+                    continue;
+                }
+                u64 j = i;
+                while (j < length && current[j] == pre[j]) {
+                    ++j;
+                }
+                memory->TryWriteBacking(std::bit_cast<u8*>(range.start + i), gpu + i, j - i);
+                merge_bytes_kept += j - i;
+                i = j;
+            }
+        }
+        merge_buffers.push_back(std::move(merge.gpu));
+        it = merges.erase(it);
+        ++merges_resolved;
+    }
+    merge_lo = ~0ULL;
+    merge_hi = 0;
+    for (const auto& merge : merges) {
+        for (const auto& range : merge.ranges) {
+            merge_lo = std::min(merge_lo, range.start);
+            merge_hi = std::max(merge_hi, range.end);
+        }
+    }
+    merge_count.store(u32(merges.size()), std::memory_order_release);
 }
 
 BufferCache::EagerWindow* BufferCache::FindEagerWindow(VAddr base) {
@@ -302,6 +505,7 @@ void BufferCache::NoteEagerWrite(VAddr address, u64 size) {
 }
 
 void BufferCache::SnapshotReadbacks(u64 tick) {
+    ResolveMerges(false);
     if (!eager_readbacks || !eager_count) {
         return;
     }
@@ -423,6 +627,16 @@ void BufferCache::ReportEagerReadbacks() {
     if (now - eager_report < std::chrono::seconds(5)) {
         return;
     }
+    if (merges_deferred || merges_resolved) {
+        std::printf("Write merge: %llu CPU writes without a GPU wait, %llu merged (%llu waited), "
+                    "%llu GPU bytes kept, %u pending\n",
+                    static_cast<unsigned long long>(merges_deferred),
+                    static_cast<unsigned long long>(merges_resolved),
+                    static_cast<unsigned long long>(merges_waited),
+                    static_cast<unsigned long long>(merge_bytes_kept),
+                    merge_count.load(std::memory_order_relaxed));
+    }
+    merges_deferred = merges_resolved = merges_waited = merge_bytes_kept = 0;
     if (eager_served || eager_missed) {
         std::printf("Eager readback: %llu reads from snapshots (%llu waited, %.1f ms), %llu full "
                     "GPU waits (%llu CPU writes; %llu untracked, %llu written since snapshot), "
@@ -557,7 +771,8 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         NoteHotUse(device_addr, size);
     }
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
-    if (!is_written && size <= STREAM_THRESHOLD && !IsRegionGpuModified(device_addr, size)) {
+    if (!is_written && size <= STREAM_THRESHOLD && !IsRegionGpuModified(device_addr, size) &&
+        !MergePending(device_addr, size)) {
         if (stats) {
             auto& region = Stats().regions[RegionKey(device_addr)];
             ++region.stream_count;
@@ -602,13 +817,14 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         if (eager_count) {
             NoteEagerWrite(device_addr, size);
         }
+        DropMergeRanges(device_addr, size);
     }
     return {arena, arena->Offset(device_addr)};
 }
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_addr, u32 size) {
     texture_cache.ResolveReadbacks(device_addr, size, true, ReadbackSource::BufferForImage);
-    if (IsRegionGpuModified(device_addr, size)) {
+    if (IsRegionGpuModified(device_addr, size) || MergePending(device_addr, size)) {
         return ObtainBuffer(device_addr, size, false);
     }
     const auto staging = staging_pool.Request(size, VideoCore::MemoryType::HostUncached,
@@ -780,8 +996,29 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
     memory_tracker->ForEachUploadRange(
         device_addr, size, is_written,
         [&](u64 addr, u64 size) {
-            copies.emplace_back(total_size_bytes, addr, size);
-            total_size_bytes += size;
+            if (!MergePending(addr, size)) {
+                copies.emplace_back(total_size_bytes, addr, size);
+                total_size_bytes += size;
+                return;
+            }
+            // tlg: whole pages are uploaded; the bytes a pending write merge owns (the GPU's,
+            // unchanged by the CPU) are left out so the stale guest copy does not replace them.
+            boost::container::small_vector<std::pair<VAddr, VAddr>, 8> owned;
+            ForEachMergeOwned(addr, size, [&](const WriteMerge&, const MergeRange&, VAddr start,
+                                              VAddr end) { owned.emplace_back(start, end); });
+            std::ranges::sort(owned);
+            VAddr cursor = addr;
+            const auto emit = [&](VAddr start, VAddr end) {
+                if (start < end) {
+                    copies.emplace_back(total_size_bytes, start, end - start);
+                    total_size_bytes += end - start;
+                }
+            };
+            for (const auto& [start, end] : owned) {
+                emit(cursor, start);
+                cursor = std::max(cursor, end);
+            }
+            emit(cursor, addr + size);
         },
         [&] { src_buffer = UploadCopies(arena, copies, total_size_bytes); });
 
