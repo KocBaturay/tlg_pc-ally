@@ -124,6 +124,10 @@ public:
     /// Commits pending sparse buffer memory binds. Must be called before every scheduler submit.
     void SubmitPendingArenaBinds(Vulkan::SubmitInfo& info);
 
+    /// tlg: eager readback report only: which path binds the next GPU-written range
+    /// (0 shader storage buffer, 1 DMA fill, 2 DMA copy, 3 HLE copy shader).
+    u32 eager_write_source = 0;
+
     /// tlg: records copies of the GPU-written data in the windows the CPU read back before, at
     /// the end of the command buffer about to be submitted with `tick` (Rasterizer::Flush).
     void SnapshotReadbacks(u64 tick);
@@ -167,6 +171,9 @@ private:
         u64 last_use{};
         std::array<EagerSlot, 2> slots{};
         u32 newest{};
+        /// Report only: CPU writes that missed, GPU-written bindings, and the last of each.
+        u64 write_misses{}, gpu_writes{}, last_fault{}, last_write{}, last_write_size{};
+        std::array<u32, 4> writes_by_source{};
     };
     bool DownloadFromSnapshots(VAddr device_addr, u64 size);
     EagerWindow* FindEagerWindow(VAddr base);
@@ -185,6 +192,7 @@ private:
     /// how many of the misses were CPU writes (InvalidateMemory) rather than reads.
     u64 eager_miss_cold{}, eager_miss_stale{}, eager_miss_writes{};
     bool eager_request_is_write{};
+    VAddr eager_request_addr{};
     std::chrono::steady_clock::time_point eager_report{};
 
     bool SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size, bool is_written,

@@ -3308,7 +3308,10 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
         if (is_gds) {
             return {buffer_cache.GetGdsBuffer(), address};
         }
-        return buffer_cache.ObtainBuffer(address, num_bytes, true);
+        buffer_cache.eager_write_source = 1;
+        const auto result = buffer_cache.ObtainBuffer(address, num_bytes, true);
+        buffer_cache.eager_write_source = 0;
+        return result;
     }();
     runtime.FillBuffer(buffer, offset, num_bytes, value);
 }
@@ -3335,7 +3338,10 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
         if (dst_gds) {
             return {gds_buffer, dst};
         }
-        return buffer_cache.ObtainBuffer(dst, num_bytes, true, true);
+        buffer_cache.eager_write_source = 2;
+        const auto result = buffer_cache.ObtainBuffer(dst, num_bytes, true, true);
+        buffer_cache.eager_write_source = 0;
+        return result;
     }();
     const vk::BufferCopy copy = {
         .srcOffset = src_offset,

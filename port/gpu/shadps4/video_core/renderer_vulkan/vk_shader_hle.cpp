@@ -212,8 +212,10 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
         // Obtain buffers for the total source and destination ranges.
         const auto [src_buf, src_buf_offset] = buffer_cache.ObtainBuffer(
             src_buf_sharp.base_address + src_offset_min, src_offset_max - src_offset_min, false);
+        buffer_cache.eager_write_source = 3;
         const auto [dst_buf, dst_buf_offset] = buffer_cache.ObtainBuffer(
             dst_buf_sharp.base_address + dst_offset_min, dst_offset_max - dst_offset_min, true);
+        buffer_cache.eager_write_source = 0;
 
         // Apply found buffer base.
         const auto vk_copies = std::span{copies}.subspan(batch_start, batch_end - batch_start);

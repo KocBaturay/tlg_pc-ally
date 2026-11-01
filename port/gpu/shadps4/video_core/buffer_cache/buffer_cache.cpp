@@ -174,6 +174,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         const VAddr window_end = std::min<VAddr>(
             std::max<VAddr>(window_start + WindowSize, device_addr + size), arena_end);
         eager_request_is_write = is_write;
+        eager_request_addr = device_addr;
         DownloadMemory(arena, window_start, window_end - window_start);
         eager_request_is_write = false;
         if (is_write) {
@@ -292,6 +293,10 @@ void BufferCache::NoteEagerWrite(VAddr address, u64 size) {
     for (auto& window : eager_windows) {
         if (window.base && window.base < end && address < window.base + EAGER_WINDOW_SIZE) {
             ++window.write_seq;
+            ++window.gpu_writes;
+            ++window.writes_by_source[eager_write_source & 3];
+            window.last_write = address;
+            window.last_write_size = size;
         }
     }
 }
@@ -372,6 +377,13 @@ bool BufferCache::DownloadFromSnapshots(VAddr device_addr, u64 size) {
     if (!covered && !ranges.empty()) {
         eager_miss_cold += cold;
         eager_miss_stale += !cold;
+        if (!cold && eager_request_is_write) {
+            if (EagerWindow* window =
+                    FindEagerWindow(Common::AlignDown(eager_request_addr, EAGER_WINDOW_SIZE))) {
+                ++window->write_misses;
+                window->last_fault = eager_request_addr;
+            }
+        }
     }
     if (!covered || ranges.empty()) {
         return false;
@@ -422,6 +434,32 @@ void BufferCache::ReportEagerReadbacks() {
                     static_cast<unsigned long long>(eager_miss_cold),
                     static_cast<unsigned long long>(eager_miss_stale),
                     static_cast<unsigned long long>(eager_snapshots), eager_count);
+        // The windows whose CPU writes missed most: where the GPU wrote and the CPU then wrote.
+        std::array<EagerWindow*, EAGER_WINDOWS> order{};
+        for (size_t i = 0; i < EAGER_WINDOWS; ++i) {
+            order[i] = &eager_windows[i];
+        }
+        std::partial_sort(order.begin(), order.begin() + 4, order.end(),
+                          [](const EagerWindow* a, const EagerWindow* b) {
+                              return a->write_misses > b->write_misses;
+                          });
+        for (size_t i = 0; i < 4 && order[i]->write_misses; ++i) {
+            const EagerWindow& w = *order[i];
+            std::printf("  write misses %llu in %#llx: last CPU write %#llx; %llu GPU writes "
+                        "(shader %u, fill %u, copy %u, hle %u), last %#llx+%llu\n",
+                        static_cast<unsigned long long>(w.write_misses),
+                        static_cast<unsigned long long>(w.base),
+                        static_cast<unsigned long long>(w.last_fault),
+                        static_cast<unsigned long long>(w.gpu_writes),
+                        w.writes_by_source[0], w.writes_by_source[1], w.writes_by_source[2],
+                        w.writes_by_source[3],
+                        static_cast<unsigned long long>(w.last_write),
+                        static_cast<unsigned long long>(w.last_write_size));
+        }
+    }
+    for (auto& window : eager_windows) {
+        window.write_misses = window.gpu_writes = 0;
+        window.writes_by_source = {};
     }
     eager_served = eager_waited = eager_missed = eager_snapshots = eager_wait_ns = 0;
     eager_miss_cold = eager_miss_stale = eager_miss_writes = 0;
