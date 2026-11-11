@@ -119,6 +119,13 @@ public:
         return gpu_modified_ranges.Intersects(addr, size) || MergePending(addr, size);
     }
 
+    /// tlg: the part of HasPendingGpuWrite that is safe from the draw pipe's first stage while
+    /// the recording stage runs: `merges` is guarded by merge_mutex, gpu_modified_ranges is not
+    /// (stage B adds to it in ObtainBuffer; a concurrent lookup can loop in a corrupted tree).
+    [[nodiscard]] bool HasPendingMerge(VAddr addr, size_t size) const {
+        return MergePending(addr, size);
+    }
+
     /// Processes the fault buffer.
     void ProcessFaultBuffer();
 

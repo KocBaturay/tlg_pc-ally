@@ -688,9 +688,10 @@ void Rasterizer::CollectRingBindings(const Shader::Info& stage, const PreparedDr
         }
         // The stream path of BufferCache::ObtainBuffer, taken here: small, read-only, not
         // written by the GPU (now or by work still queued for the recording thread).
+        // Not HasPendingGpuWrite: stage B changes gpu_modified_ranges concurrently, unlocked.
         if (size == 0 || size > VideoCore::BufferCache::STREAM_THRESHOLD ||
             buffer_cache.IsRegionGpuModified(address, size) || PendingWriteOverlaps(address, size) ||
-            buffer_cache.HasPendingGpuWrite(address, size)) {
+            buffer_cache.HasPendingMerge(address, size)) {
             continue;
         }
         copy(index, nullptr, address, size);
